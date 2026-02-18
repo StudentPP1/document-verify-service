@@ -12,16 +12,16 @@ import {
     TextFieldType,
     Result
 } from '@regulaforensics/document-reader-webclient';
-import 'dotenv/config'; 
+import 'dotenv/config';
 
-const { DOCUMENT_NUMBER, SURNAME_AND_GIVEN_NAMES, DATE_OF_BIRTH } = TextFieldType;
+const { DOCUMENT_NUMBER, SURNAME_AND_GIVEN_NAMES, DATE_OF_BIRTH, DATE_OF_EXPIRY } = TextFieldType;
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 4000;
 const DOC_READER_URL = process.env.DOC_READER_URL;
 const FACE_SDK_URL = process.env.FACE_SDK_URL;
 
@@ -53,6 +53,7 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
         const selfieBase64 = fs.readFileSync(selfie[0].path).toString('base64');
 
         console.log('[INFO] Sending to Document Reader...');
+        
         const docResponse = await docApi.process({
             images: [
                 {
@@ -63,88 +64,99 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
             ],
             processParam: {
                 scenario: Scenario.FULL_PROCESS,
-                alreadyCropped: false, 
+                alreadyCropped: false,
             },
         });
+
         const getFieldVal = (type) => {
             const field = docResponse.text?.getField(type);
             return field ? field.value : null;
         };
-
-        const docType = docResponse.documentType()?.DocumentName || 'UNKNOWN';
         
+        let docType = docResponse.documentType()?.DocumentName;
+        if (!docType || docType.trim() === '') {
+            docType = 'UNKNOWN';
+        }
+
         const docData = {
             number: getFieldVal(DOCUMENT_NUMBER),
             name: getFieldVal(SURNAME_AND_GIVEN_NAMES),
             dob: getFieldVal(DATE_OF_BIRTH),
+            expiry: getFieldVal(DATE_OF_EXPIRY),
             type: docType
         };
 
         const overallStatus = docResponse.status.overallStatus;
-
-        console.log('--------------------------------------------------');
-        console.log(`[DEBUG] STATUSES (0=OK, 1=WARN, 2=ERR):`);
-        console.log(`Overall: ${overallStatus}`);
-        console.log(`Type: ${docType}`);
-        console.log(`Name Extracted: ${docData.name ? 'YES' : 'NO'}`);
-        console.log('--------------------------------------------------');
-
         const docErrors = [];
 
+        if (docType === 'UNKNOWN') {
+            docErrors.push("Document type NOT recognized (Unknown document)");
+        }
         if (overallStatus === Result.ERROR) {
-            docErrors.push("Overall status is ERROR");
+            docErrors.push("Critical Error: Document validation failed");
         }
-
-        if (docType === 'UNKNOWN' || !docType) {
-            docErrors.push("Unknown document type (Not recognized)");
+        let isExpiredManual = false;
+        if (docData.expiry) {
+            const expiryDate = new Date(docData.expiry);
+            const today = new Date();
+            today.setHours(0,0,0,0);
+            
+            if (expiryDate < today) {
+                isExpiredManual = true;
+                docErrors.push(`Document is EXPIRED (Valid until: ${docData.expiry})`);
+            }
+        } else {
+            if (docType === 'UNKNOWN') docErrors.push("No expiry date found on unknown document");
         }
-
         if (!docData.number && !docData.name) {
-            docErrors.push("No text data extracted (Blurry or blank image)");
+            docErrors.push("No text data extracted (Image too blurry or empty)");
         }
 
-        const isDocumentValid = overallStatus !== Result.ERROR && 
-                                docType !== 'UNKNOWN' &&
-                                (docData.number !== null || docData.name !== null);
+        const isDocumentValid = docErrors.length === 0;
 
-        console.log(`[INFO] Document Valid Decision: ${isDocumentValid ? 'VALID' : 'INVALID'}`);
-        if (!isDocumentValid) console.log(`[INFO] Errors: ${docErrors.join(', ')}`);
+        console.log(`[DEBUG] Report:`);
+        console.log(`Type: ${docType}`);
+        console.log(`Overall Status: ${overallStatus}`);
+        console.log(`Manual Expiry Check: ${isExpiredManual ? 'FAIL' : 'PASS'}`);
+        console.log(`Errors: ${docErrors.length}`);
+        console.log(`FINAL DECISION: ${isDocumentValid ? 'VALID' : 'INVALID'}`);
 
         const portraitField = docResponse.images.getField(GraphicFieldType.PORTRAIT);
-        if (!portraitField) {
-            throw new Error('Portrait not found in document');
+        let docFaceBase64 = null;
+        if (portraitField) {
+            const portraitDataArray = portraitField.getValue(Source.VISUAL) || portraitField.getValue(Source.RFID);
+            if(portraitDataArray) docFaceBase64 = Buffer.from(portraitDataArray).toString('base64');
         }
 
-        const portraitDataArray = portraitField.getValue(Source.VISUAL) || portraitField.getValue(Source.RFID);
-     
-        const docFaceBase64 = Buffer.from(portraitDataArray).toString('base64');
+        if (!docFaceBase64) {
+            console.error('[ERROR] No face found in document');
+            res.json({
+                success: false,
+                verificationStatus: 'REJECTED',
+                checks: {
+                    faceMatch: { passed: false, error: 'No face in document' },
+                    documentValidation: { passed: isDocumentValid, errors: [...docErrors, "No face found"] }
+                },
+                data: docData
+            });
+            return;
+        }
 
         console.log('[INFO] Matching faces...');
         
         const matchResponse = await faceSdk.matchApi.match({
             images: [
-                {
-                    type: ImageSource.DOCUMENT_PRINT,
-                    data: docFaceBase64,
-                    index: 1
-                },
-                {
-                    type: ImageSource.LIVE,
-                    data: selfieBase64,
-                    index: 2
-                }
+                { type: ImageSource.DOCUMENT_PRINT, data: docFaceBase64, index: 1 },
+                { type: ImageSource.LIVE, data: selfieBase64, index: 2 }
             ]
         });
 
         const results = matchResponse.results || matchResponse.Results;
-        if (!results || results.length === 0) {
-            throw new Error("No match results returned from Face SDK");
-        }
+        if (!results || results.length === 0) throw new Error("No match results");
 
         const similarity = results[0].similarity * 100;
-        const isFaceMatch = similarity > 75;
-
         console.log(`[INFO] Similarity: ${similarity.toFixed(2)}%`);
+        const isFaceMatch = similarity > 75;
 
         res.json({
             success: isFaceMatch && isDocumentValid,
@@ -165,10 +177,7 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
 
     } catch (error) {
         console.error('[ERROR] Processing failed:', error.message);
-        res.status(500).json({ 
-            success: false, 
-            error: error.message 
-        });
+        res.status(500).json({ success: false, error: error.message });
     } finally {
         cleanupFiles(cleanupList);
     }
