@@ -7,10 +7,11 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1",
+    "@regulaforensics/document-reader-webclient": "^9.2.741",
+    "@regulaforensics/facesdk-webclient": "^7.2.364",
     "cors": "^2.8.5",
-    "@regulaforensics/document-reader-webclient": "^7.2.0",
-    "@regulaforensics/facesdk-webclient": "^6.2.0"
+    "dotenv": "^17.3.1",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }

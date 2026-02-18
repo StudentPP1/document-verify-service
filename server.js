@@ -9,17 +9,21 @@ import {
     Light,
     Source,
     GraphicFieldType,
+    TextFieldType,
+    Result
 } from '@regulaforensics/document-reader-webclient';
+import 'dotenv/config'; 
 
+const { DOCUMENT_NUMBER, SURNAME_AND_GIVEN_NAMES, DATE_OF_BIRTH } = TextFieldType;
 const app = express();
 const upload = multer({ dest: 'uploads/' });
 
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 4000;
-const DOC_READER_URL = (process.env.DOC_READER_URL || 'http://localhost:8080').replace(/\/$/, '');
-const FACE_SDK_URL = process.env.FACE_SDK_URL || 'http://localhost:41101';
+const PORT = process.env.PORT;
+const DOC_READER_URL = process.env.DOC_READER_URL;
+const FACE_SDK_URL = process.env.FACE_SDK_URL;
 
 const faceSdk = new FaceSdk({ basePath: FACE_SDK_URL });
 const docApi = new DocumentReaderApi({ basePath: DOC_READER_URL });
@@ -43,13 +47,12 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
     }
 
     try {
-        console.log(`[INFO] Processing: ${passport[0].originalname} (Passport) & ${selfie[0].originalname} (Selfie)`);
+        console.log(`[INFO] Processing: ${passport[0].originalname} & ${selfie[0].originalname}`);
 
-        const passportBuffer = fs.readFileSync(passport[0].path);
+        const passportBuffer = fs.readFileSync(passport[0].path).buffer;
         const selfieBase64 = fs.readFileSync(selfie[0].path).toString('base64');
 
         console.log('[INFO] Sending to Document Reader...');
-        
         const docResponse = await docApi.process({
             images: [
                 {
@@ -63,33 +66,62 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
                 alreadyCropped: false, 
             },
         });
+        const getFieldVal = (type) => {
+            const field = docResponse.text?.getField(type);
+            return field ? field.value : null;
+        };
+
+        const docType = docResponse.documentType()?.DocumentName || 'UNKNOWN';
+        
+        const docData = {
+            number: getFieldVal(DOCUMENT_NUMBER),
+            name: getFieldVal(SURNAME_AND_GIVEN_NAMES),
+            dob: getFieldVal(DATE_OF_BIRTH),
+            type: docType
+        };
+
+        const overallStatus = docResponse.status.overallStatus;
+
+        console.log('--------------------------------------------------');
+        console.log(`[DEBUG] STATUSES (0=OK, 1=WARN, 2=ERR):`);
+        console.log(`Overall: ${overallStatus}`);
+        console.log(`Type: ${docType}`);
+        console.log(`Name Extracted: ${docData.name ? 'YES' : 'NO'}`);
+        console.log('--------------------------------------------------');
+
+        const docErrors = [];
+
+        if (overallStatus === Result.ERROR) {
+            docErrors.push("Overall status is ERROR");
+        }
+
+        if (docType === 'UNKNOWN' || !docType) {
+            docErrors.push("Unknown document type (Not recognized)");
+        }
+
+        if (!docData.number && !docData.name) {
+            docErrors.push("No text data extracted (Blurry or blank image)");
+        }
+
+        const isDocumentValid = overallStatus !== Result.ERROR && 
+                                docType !== 'UNKNOWN' &&
+                                (docData.number !== null || docData.name !== null);
+
+        console.log(`[INFO] Document Valid Decision: ${isDocumentValid ? 'VALID' : 'INVALID'}`);
+        if (!isDocumentValid) console.log(`[INFO] Errors: ${docErrors.join(', ')}`);
 
         const portraitField = docResponse.images.getField(GraphicFieldType.PORTRAIT);
         if (!portraitField) {
-            console.error('[ERROR] Portrait not found in document');
-            return res.json({ success: false, reason: 'PORTRAIT_NOT_FOUND' });
+            throw new Error('Portrait not found in document');
         }
 
         const portraitDataArray = portraitField.getValue(Source.VISUAL) || portraitField.getValue(Source.RFID);
-        if (!portraitDataArray) {
-             console.error('[ERROR] Portrait data is empty');
-             return res.json({ success: false, reason: 'PORTRAIT_DATA_EMPTY' });
-        }
-
+     
         const docFaceBase64 = Buffer.from(portraitDataArray).toString('base64');
-        const docName = docResponse.documentType()?.DocumentName || 'UNKNOWN';
-        console.log(`[INFO] Document processed: ${docName}`);
-        console.log(`[DEBUG] DocFace Size: ${docFaceBase64.length} chars | Selfie Size: ${selfieBase64.length} chars`);
 
         console.log('[INFO] Matching faces...');
-        if (!docFaceBase64 || docFaceBase64.length === 0) {
-            throw new Error('Portrait extraction failed: no face data from document');
-        }
-        if (!selfieBase64 || selfieBase64.length === 0) {
-            throw new Error('Selfie processing failed: no valid image data');
-        }
         
-        const matchResponse = await faceSdk.matchingApi.match({
+        const matchResponse = await faceSdk.matchApi.match({
             images: [
                 {
                     type: ImageSource.DOCUMENT_PRINT,
@@ -104,47 +136,38 @@ app.post('/api/verify', upload.fields([{ name: 'passport' }, { name: 'selfie' }]
             ]
         });
 
-        console.log('[DEBUG] Face SDK Response:', JSON.stringify(matchResponse, null, 2).substring(0, 500));
-
-        const results = matchResponse.results;
+        const results = matchResponse.results || matchResponse.Results;
         if (!results || results.length === 0) {
-            console.error('[ERROR] Face SDK returned 0 results. Check if images contain faces.');
-            console.error('[DEBUG] Full response structure:', JSON.stringify(matchResponse, null, 2));
             throw new Error("No match results returned from Face SDK");
         }
-        
-        const matchResult = results[0];
-        if (!matchResult.similarity && matchResult.similarity !== 0) {
-            console.error('[ERROR] No similarity score in Face SDK response');
-            throw new Error("Invalid Face SDK response: missing similarity score");
-        }
 
-        const similarity = matchResult.similarity * 100;
+        const similarity = results[0].similarity * 100;
+        const isFaceMatch = similarity > 75;
+
         console.log(`[INFO] Similarity: ${similarity.toFixed(2)}%`);
 
-        const isMatch = similarity > 75;
-
         res.json({
-            success: isMatch,
-            verificationStatus: isMatch ? 'VERIFIED' : 'REJECTED',
-            similarity: parseFloat(similarity.toFixed(2)),
-            docType: docName,
-            details: { documentValid: true, faceMatch: isMatch }
+            success: isFaceMatch && isDocumentValid,
+            verificationStatus: (isFaceMatch && isDocumentValid) ? 'VERIFIED' : 'REJECTED',
+            checks: {
+                faceMatch: {
+                    passed: isFaceMatch,
+                    similarity: parseFloat(similarity.toFixed(2))
+                },
+                documentValidation: {
+                    passed: isDocumentValid,
+                    status: overallStatus, 
+                    errors: docErrors
+                }
+            },
+            data: docData
         });
 
     } catch (error) {
         console.error('[ERROR] Processing failed:', error.message);
-        console.error('[ERROR] Stack trace:', error.stack);
-        if (error.response) {
-            console.error('[DEBUG] API Status:', error.response.status);
-            console.error('[DEBUG] API Error Details:', JSON.stringify(error.response.data, null, 2));
-        }
-        const statusCode = error.response?.status || 500;
-        res.status(statusCode).json({ 
-            success: false,
-            error: 'Processing failed', 
-            details: error.message,
-            reason: error.message.includes('No match') ? 'NO_FACES_DETECTED' : 'PROCESSING_ERROR'
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
         });
     } finally {
         cleanupFiles(cleanupList);
