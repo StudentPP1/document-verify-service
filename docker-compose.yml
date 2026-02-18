@@ -1,6 +1,20 @@
-version: "3.7"
-
 services:
+  server:
+    container_name: app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - DOC_READER_URL=http://docreader:8080
+      - FACE_SDK_URL=http://faceapi:41101
+    ports:
+      - "4000:4000"
+    networks:
+      - api-network
+    depends_on:
+      - docreader
+      - faceapi
+
   docreader:
     container_name: docreader
     image: regulaforensics/docreader:latest
@@ -8,7 +22,7 @@ services:
       - ./regula.license:/app/extBin/unix/regula.license
       - ./docreader_config.yaml:/app/docreader_config.yaml
     networks:
-      - docreader-network
+      - api-network
     healthcheck:
       test: curl -f http://127.0.0.1:8080/api/ping
       interval: 60s
@@ -27,7 +41,7 @@ services:
     ports:
       - "41101:41101"
     networks:
-      - faceapi-network
+      - api-network
     depends_on:
       - "db-postgres"
       - "minio"
@@ -49,7 +63,7 @@ services:
     ports:
       - "5432:5432"
     networks:
-      - faceapi-network
+      - api-network
 
   minio:
     container_name: milvus-minio
@@ -69,7 +83,7 @@ services:
       timeout: 20s
       retries: 3
     networks:
-      - faceapi-network
+      - api-network
 
   etcd:
     container_name: milvus-etcd
@@ -83,7 +97,7 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     networks:
-      - faceapi-network
+      - api-network
 
   milvus-standalone:
     container_name: milvus-standalone
@@ -100,7 +114,7 @@ services:
       - "19530:19530"
       - "9091:9091"
     networks:
-      - faceapi-network
+      - api-network
     depends_on:
       - "etcd"
       - "minio"
@@ -113,14 +127,12 @@ services:
     ports:
       - "3000:3000"
     networks:
-      - faceapi-network
+      - api-network
     depends_on:
       - "milvus-standalone"
 
 networks:
-  faceapi-network:
-    driver: bridge
-  docreader-network:
+  api-network:
     driver: bridge
 
 volumes:
