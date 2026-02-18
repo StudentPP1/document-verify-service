@@ -1,0 +1,130 @@
+version: "3.7"
+
+services:
+  docreader:
+    container_name: docreader
+    image: regulaforensics/docreader:latest
+    volumes:
+      - ./regula.license:/app/extBin/unix/regula.license
+      - ./docreader_config.yaml:/app/docreader_config.yaml
+    networks:
+      - docreader-network
+    healthcheck:
+      test: curl -f http://127.0.0.1:8080/api/ping
+      interval: 60s
+      start_period: 60s
+      timeout: 30s
+      retries: 5
+    ports:
+      - "8080:8080"
+
+  faceapi:
+    image: regulaforensics/face-api:latest
+    container_name: faceapi
+    volumes:
+      - ./regula.license:/app/extBin/unix/regula.license
+      - ./faceapi_config.yaml:/app/faceapi_config.yaml
+    ports:
+      - "41101:41101"
+    networks:
+      - faceapi-network
+    depends_on:
+      - "db-postgres"
+      - "minio"
+      - "etcd"
+      - "milvus-standalone"
+      - "attu"
+    restart: always
+
+  db-postgres:
+    image: postgres:17
+    container_name: db-postgres
+    restart: unless-stopped
+    volumes:
+      - postgre-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: "regula_db"
+      POSTGRES_USER: "regula"
+      POSTGRES_PASSWORD: "Regulapasswd#1"
+    ports:
+      - "5432:5432"
+    networks:
+      - faceapi-network
+
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    volumes:
+      - minio-data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - faceapi-network
+
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - etcd-data:/etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    networks:
+      - faceapi-network
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.5.6
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    volumes:
+      - milvus-data:/var/lib/milvus
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    networks:
+      - faceapi-network
+    depends_on:
+      - "etcd"
+      - "minio"
+
+  attu:
+    container_name: milvus-attu
+    image: zilliz/attu:v2.3.8
+    environment:
+      MILVUS_URL: milvus-standalone:19530
+    ports:
+      - "3000:3000"
+    networks:
+      - faceapi-network
+    depends_on:
+      - "milvus-standalone"
+
+networks:
+  faceapi-network:
+    driver: bridge
+  docreader-network:
+    driver: bridge
+
+volumes:
+  postgre-data: {}
+  minio-data: {}
+  etcd-data: {}
+  milvus-data: {}
